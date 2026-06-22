@@ -76,6 +76,7 @@
   precision highp int;
   #define MAX_XFORMS 6
   #define MAX_ITER 16
+  #define MAX_PRE_ITER 32
 
   uniform vec4 u_xform_a0[MAX_XFORMS]; // affine row 0: (a, b, c, _)
   uniform vec4 u_xform_a1[MAX_XFORMS]; // affine row 1: (d, e, f, _)
@@ -83,7 +84,7 @@
   uniform float u_var_params[4]; // generic variation parameters
   uniform int u_xform_count;
   uniform int u_k_iter;          // total iterations per vertex
-  uniform int u_pre_iter;        // skip first N (for burn-in)
+  uniform int u_pre_iter;        // burn-in iterations before visible
   uniform int u_output_index;    // which iteration to emit (0..u_k_iter-1)
   uniform float u_seed;          // global time-varying seed
   uniform float u_final_color;   // final color index
@@ -108,6 +109,12 @@
   vec2 v_blob(vec2 p)          { float r = length(p); float t = atan(p.y, p.x); return r * (1.0 + 0.5 * cos(2.0 * t)) * vec2(cos(t), sin(t)); }
   vec2 v_fisheye(vec2 p)       { float r = length(p); return r < 1e-6 ? vec2(0.0) : (2.0 * p) / (r + 1.0); }
   vec2 v_tangent(vec2 p)       { return vec2(sin(p.x) / cos(p.y), tan(p.y)); }
+  // Phase D additions
+  vec2 v_ring(vec2 p)          { float r2 = dot(p,p); return vec2(sin(r2) * p.x, cos(r2) * p.y); }
+  vec2 v_fan(vec2 p)           { float r = length(p); float t = atan(p.y, p.x); float hpi = 1.5707963; if (abs(t) > hpi) t = (t > 0.0 ? 3.14159265 : -3.14159265) - t; return vec2(r * (4.0 * t - cos(t)), r * 4.0 * sin(t)); }
+  vec2 v_popcorn(vec2 p)       { return p + vec2(0.05 * sin(3.0 * p.y), 0.05 * sin(3.0 * p.x)); }
+  vec2 v_loonie(vec2 p)        { float r2 = dot(p,p); float r = sqrt(r2); return r < 1e-6 ? vec2(0.0) : vec2(p.x * r2 / r, p.y * (p.x*p.x - p.y*p.y) / r); }
+  vec2 v_waves(vec2 p)         { return p + vec2(0.08 * sin(2.0 * p.y), 0.08 * sin(2.0 * p.x)); }
 
   vec2 apply_variation(vec2 p, int vid) {
     if (vid == 0)  return v_linear(p);
@@ -124,6 +131,11 @@
     if (vid == 11) return v_blob(p);
     if (vid == 12) return v_fisheye(p);
     if (vid == 13) return v_tangent(p);
+    if (vid == 14) return v_ring(p);
+    if (vid == 15) return v_fan(p);
+    if (vid == 16) return v_popcorn(p);
+    if (vid == 17) return v_loonie(p);
+    if (vid == 18) return v_waves(p);
     return p;
   }
 
@@ -133,7 +145,6 @@
 
     // Initial random point in [-1.5, 1.5]
     vec2 p = vec2(hash21(vec2(baseSeed, 1.0)), hash21(vec2(baseSeed, 2.0))) * 3.0 - 1.5;
-    vec3 color = vec3(u_final_color);
 
     // Pre-compute total weight for selection
     float totalW = 0.0;
@@ -141,6 +152,35 @@
       if (i >= u_xform_count) break;
       totalW += u_xform_meta[i].y;
     }
+
+    // ===== BURN-IN (Phase D fix): settle into the IFS attractor =====
+    // Without this, each vertex starts at random scatter and only iterates 4 times,
+    // so visible samples look like noisy blurs instead of the actual fractal pattern.
+    // We pre-iterate u_pre_iter times (discarding trajectory/color) so the visible
+    // iterations emit points that are already on the attractor.
+    for (int b = 0; b < MAX_PRE_ITER; b++) {
+      if (b >= u_pre_iter) break;
+
+      float rb = hash11(baseSeed + float(b) * 3.71 + 0.9);
+      rb *= totalW;
+      float cumb = 0.0;
+      int chosenB = 0;
+      for (int i = 0; i < MAX_XFORMS; i++) {
+        if (i >= u_xform_count) break;
+        cumb += u_xform_meta[i].y;
+        if (rb < cumb) { chosenB = i; break; }
+      }
+
+      vec4 a0b = u_xform_a0[chosenB];
+      vec4 a1b = u_xform_a1[chosenB];
+      vec2 qb = vec2(a0b.x * p.x + a0b.y * p.y + a0b.z,
+                     a1b.x * p.x + a1b.y * p.y + a1b.z);
+      int vidB = int(u_xform_meta[chosenB].z + 0.5);
+      p = apply_variation(qb, vidB);
+    }
+
+    // Reset color after burn-in so visible samples start fresh
+    vec3 color = vec3(u_final_color);
 
     vec2 traj[MAX_ITER];
     vec3 colTraj[MAX_ITER];
@@ -464,6 +504,8 @@
       linear: 0, sinusoidal: 1, spherical: 2, swirl: 3, horseshoe: 4,
       polar: 5, handkerchief: 6, heart: 7, disc: 8, julian: 9,
       juliaN: 10, blob: 11, fisheye: 12, tangent: 13,
+      // Phase D additions
+      ring: 14, fan: 15, popcorn: 16, loonie: 17, waves: 18,
     };
     function variationId(name) { return VARIATION_IDS[name] ?? 0; }
 
