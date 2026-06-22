@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebSheep — Fractal Flame Screensaver</title>
+  <style>
+    html, body { margin: 0; padding: 0; overflow: hidden; background: #000; height: 100%; cursor: none; }
+    canvas { display: block; width: 100vw; height: 100vh; image-rendering: auto; }
+    .hud {
+      position: fixed; bottom: 16px; left: 16px;
+      color: rgba(255,255,255,0.55); font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 11px; pointer-events: none;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.9), 0 0 12px rgba(0,0,0,0.5);
+      letter-spacing: 0.02em;
+    }
+    #help {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      color: rgba(255,255,255,0.92); font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 13px;
+      background: rgba(8,8,12,0.92); padding: 22px 28px;
+      border: 1px solid rgba(255,255,255,0.15); border-radius: 10px;
+      width: 380px; line-height: 1.6;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.3s;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+    #help.show { opacity: 1; }
+    #help h2 { margin: 0 0 14px 0; font-size: 14px; color: #fff; letter-spacing: 0.05em; text-transform: uppercase; }
+    #help .row { display: flex; justify-content: space-between; align-items: center; margin: 5px 0; gap: 12px; }
+    #help .desc { opacity: 0.75; }
+    #help kbd {
+      display: inline-block; padding: 2px 8px;
+      background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 4px; min-width: 80px; text-align: center;
+      font-family: inherit; font-size: 12px;
+    }
+    #notice {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      color: rgba(255,255,255,0.95); font-family: ui-monospace, monospace;
+      font-size: 13px;
+      background: rgba(8,8,12,0.95); padding: 20px 28px;
+      border: 1px solid rgba(255,255,255,0.18); border-radius: 10px;
+      text-align: center; line-height: 1.7;
+      opacity: 1; pointer-events: none;
+      transition: opacity 0.6s;
+    }
+    #notice.fade { opacity: 0; }
+  </style>
+</head>
+<body>
+  <canvas id="gl"></canvas>
+  <div class="hud" id="hud">WebSheep · press <kbd style="background:rgba(255,255,255,0.1);padding:0 5px;border-radius:3px;font-family:monospace;font-size:11px">?</kbd> for help</div>
+  <div id="help">
+    <h2>WebSheep</h2>
+    <div class="row"><kbd>F</kbd><span class="desc">fullscreen</span></div>
+    <div class="row"><kbd>→ / Space</kbd><span class="desc">next sheep</span></div>
+    <div class="row"><kbd>←</kbd><span class="desc">previous sheep</span></div>
+    <div class="row"><kbd>↑</kbd><span class="desc">vote up</span></div>
+    <div class="row"><kbd>↓</kbd><span class="desc">vote down</span></div>
+    <div class="row"><kbd>M</kbd><span class="desc">mutate (spawn child)</span></div>
+    <div class="row"><kbd>X</kbd><span class="desc">crossover w/ random</span></div>
+    <div class="row"><kbd>P</kbd><span class="desc">pause animation</span></div>
+    <div class="row"><kbd>R</kbd><span class="desc">reset accumulator</span></div>
+    <div class="row"><kbd>?</kbd><span class="desc">toggle this help</span></div>
+  </div>
+  <div id="notice">
+    WebSheep — fractal flame screensaver<br>
+    <span style="opacity:0.7">Press <kbd style="background:rgba(255,255,255,0.1);padding:0 5px;border-radius:3px;font-family:monospace;font-size:11px">F</kbd> for fullscreen, <kbd style="background:rgba(255,255,255,0.1);padding:0 5px;border-radius:3px;font-family:monospace;font-size:11px">?</kbd> for help</span>
+  </div>
+
+  <!-- =================== ACCUMULATE: VERTEX SHADER =================== -->
+  <script id="vs-acc" type="x-shader/x-vertex">#version 300 es
+  precision highp float;
+  precision highp int;
+  #define MAX_XFORMS 6
+  #define MAX_ITER 16
+
+  uniform vec4 u_xform_a0[MAX_XFORMS]; // affine row 0: (a, b, c, _)
+  uniform vec4 u_xform_a1[MAX_XFORMS]; // affine row 1: (d, e, f, _)
+  uniform vec3 u_xform_meta[MAX_XFORMS]; // (color, weight, variation_id)
+  uniform float u_var_params[4]; // generic variation parameters
+  uniform int u_xform_count;
+  uniform int u_k_iter;          // total iterations per vertex
+  uniform int u_pre_iter;        // skip first N (for burn-in)
+  uniform int u_output_index;    // which iteration to emit (0..u_k_iter-1)
+  uniform float u_seed;          // global time-varying seed
+  uniform float u_final_color;   // final color index
+
+  out vec3 v_color;
+
+  float hash11(float n) { return fract(sin(n * 43758.5453123) * 12345.6789); }
+  float hash21(vec2 p)  { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+  // Variations (input vec2 p, output vec2)
+  vec2 v_linear(vec2 p)        { return p; }
+  vec2 v_sinusoidal(vec2 p)    { return vec2(sin(p.x), sin(p.y)); }
+  vec2 v_spherical(vec2 p)     { float r = length(p); return r < 1e-6 ? vec2(0.0) : p / r; }
+  vec2 v_swirl(vec2 p)         { float r2 = dot(p,p); return vec2(p.x*sin(r2) - p.y*cos(r2), p.x*cos(r2) + p.y*sin(r2)); }
+  vec2 v_horseshoe(vec2 p)     { float r = length(p); return r < 1e-6 ? vec2(0.0) : vec2((p.x-p.y)*(p.x+p.y), 2.0*p.x*p.y)/r; }
+  vec2 v_polar(vec2 p)         { float r = length(p); return vec2(atan(p.y, p.x) / 3.14159265, r - 1.0); }
+  vec2 v_handkerchief(vec2 p)  { float r = length(p); float t = atan(p.y, p.x); return r * vec2(sin(t + r), cos(t - r)); }
+  vec2 v_heart(vec2 p)         { float r = length(p); float t = atan(p.y, p.x); return r * vec2(sin(t * r), -cos(t * r)); }
+  vec2 v_disc(vec2 p)          { float r = length(p); float t = atan(p.y, p.x); return (t / 3.14159265) * vec2(sin(3.14159265 * r), cos(3.14159265 * r)); }
+  vec2 v_julian(vec2 p)        { float r = length(p); float t = atan(p.y, p.x); float n = u_var_params[0]; float rp = (n == 0.0) ? 1.0 : pow(r, 2.0 / n); return rp * vec2(cos(t * n), sin(t * n)); }
+  vec2 v_juliaN(vec2 p)        { float r = length(p); float t = atan(p.y, p.x); return pow(r, u_var_params[1]) * vec2(cos(t), sin(t)); }
+  vec2 v_blob(vec2 p)          { float r = length(p); float t = atan(p.y, p.x); return r * (1.0 + 0.5 * cos(2.0 * t)) * vec2(cos(t), sin(t)); }
+  vec2 v_fisheye(vec2 p)       { float r = length(p); return r < 1e-6 ? vec2(0.0) : (2.0 * p) / (r + 1.0); }
+  vec2 v_tangent(vec2 p)       { return vec2(sin(p.x) / cos(p.y), tan(p.y)); }
+
+  vec2 apply_variation(vec2 p, int vid) {
+    if (vid == 0)  return v_linear(p);
+    if (vid == 1)  return v_sinusoidal(p);
+    if (vid == 2)  return v_spherical(p);
+    if (vid == 3)  return v_swirl(p);
+    if (vid == 4)  return v_horseshoe(p);
+    if (vid == 5)  return v_polar(p);
+    if (vid == 6)  return v_handkerchief(p);
+    if (vid == 7)  return v_heart(p);
+    if (vid == 8)  return v_disc(p);
+    if (vid == 9)  return v_julian(p);
+    if (vid == 10) return v_juliaN(p);
+    if (vid == 11) return v_blob(p);
+    if (vid == 12) return v_fisheye(p);
+    if (vid == 13) return v_tangent(p);
+    return p;
+  }
+
+  void main() {
+    float idf = float(gl_VertexID);
+    float baseSeed = u_seed + idf * 0.137;
+
+    // Initial random point in [-1.5, 1.5]
+    vec2 p = vec2(hash21(vec2(baseSeed, 1.0)), hash21(vec2(baseSeed, 2.0))) * 3.0 - 1.5;
+    vec3 color = vec3(u_final_color);
+
+    // Pre-compute total weight for selection
+    float totalW = 0.0;
+    for (int i = 0; i < MAX_XFORMS; i++) {
+      if (i >= u_xform_count) break;
+      totalW += u_xform_meta[i].y;
+    }
+
+    vec2 traj[MAX_ITER];
+    vec3 colTraj[MAX_ITER];
+
+    for (int k = 0; k < MAX_ITER; k++) {
+      if (k >= u_k_iter) break;
+
+      // Pick xform weighted by u_xform_meta[i].y
+      float r = hash11(baseSeed + float(k) * 7.13 + 0.5);
+      r *= totalW;
+      float cum = 0.0;
+      int chosen = 0;
+      for (int i = 0; i < MAX_XFORMS; i++) {
+        if (i >= u_xform_count) break;
+        cum += u_xform_meta[i].y;
+        if (r < cum) { chosen = i; break; }
+      }
+
+      // Apply affine: [a b c; d e f] * [x y 1]
+      vec4 a0 = u_xform_a0[chosen];
+      vec4 a1 = u_xform_a1[chosen];
+      vec2 q = vec2(a0.x * p.x + a0.y * p.y + a0.z,
+                    a1.x * p.x + a1.y * p.y + a1.z);
+
+      // Apply variation
+      int vid = int(u_xform_meta[chosen].z + 0.5);
+      q = apply_variation(q, vid);
+
+      p = q;
+
+      // Blend color toward xform's color (50% blend)
+      float xc = u_xform_meta[chosen].x;
+      color = mix(color, vec3(xc), 0.5);
+
+      // Store every iteration
+      traj[k] = p;
+      colTraj[k] = color;
+    }
+
+    int idx = clamp(u_output_index, 0, u_k_iter - 1);
+    gl_Position = vec4(traj[idx], 0.0, 1.0);
+    gl_PointSize = 1.0;
+    v_color = colTraj[idx];
+  }
+  </script>
+
+  <!-- =================== ACCUMULATE: FRAGMENT SHADER =================== -->
+  <!-- Just outputs the interpolated color. Alpha=1 so each sample counts as one hit. -->
+  <script id="fs-acc" type="x-shader/x-fragment">#version 300 es
+  precision highp float;
+  in vec3 v_color;
+  out vec4 fragColor;
+  void main() {
+    fragColor = vec4(v_color, 1.0);
+  }
+  </script>
+
+  <!-- =================== DISPLAY: VERTEX SHADER (fullscreen quad) =================== -->
+  <script id="vs-disp" type="x-shader/x-vertex">#version 300 es
+  precision highp float;
+  in vec2 a_pos;
+  out vec2 v_uv;
+  void main() {
+    v_uv = a_pos * 0.5 + 0.5;
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+  }
+  </script>
+
+  <!-- =================== DISPLAY: FRAGMENT SHADER =================== -->
+  <script id="fs-disp" type="x-shader/x-fragment">#version 300 es
+  precision highp float;
+  in vec2 v_uv;
+  out vec4 fragColor;
+  uniform sampler2D u_acc;
+  uniform sampler2D u_palette;
+  uniform float u_gamma;
+  uniform float u_vibrancy;
+  uniform float u_brightness;
+  void main() {
+    vec4 hist = texture(u_acc, v_uv);
+    float hits = hist.a;
+    if (hits < 1.0) { fragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+
+    // Average color of samples that landed here
+    vec3 avg = hist.rgb / hits;
+
+    // Map log(hits) to palette index
+    float logD = log(1.0 + hits) / 8.0;     // 8 = empirical normalization
+    logD = clamp(logD, 0.0, 1.0);
+    logD = fract(logD + u_vibrancy * 0.5);
+
+    vec3 pal = texture(u_palette, vec2(logD, 0.5)).rgb;
+    vec3 final = avg * pal * u_brightness;
+    final = pow(max(final, vec3(0.0)), vec3(1.0 / u_gamma));
+    fragColor = vec4(final, 1.0);
+  }
+  </script>
+
+  <!-- =================== MAIN =================== -->
+  <script type="module">
+    import { SHEEP_POOL } from './src/sheep-pool.js';
+    import { mutate, crossover, randomSheep } from './src/evolution.js';
+
+    // ===================== WebGL2 Renderer =====================
+    const ACC_SIZE = 1024;
+    const N_VERTS = 256 * 256;       // 65,536 vertices
+    const K_ITER = 4;                // iterations per vertex
+    const PRE_ITER = 8;              // burn-in iterations skipped
+    const MULTI_PASSES = K_ITER;     // emit each intermediate iteration
+
+    const canvas = document.getElementById('gl');
+    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, premultipliedAlpha: false });
+    if (!gl) {
+      document.body.innerHTML = '<div style="color:#fff;font-family:monospace;padding:40px">WebGL2 not available. Try Chrome, Firefox, or Safari 15+.</div>';
+      throw new Error('No WebGL2');
+    }
+    if (!gl.getExtension('EXT_color_buffer_float')) {
+      console.warn('EXT_color_buffer_float unavailable — falling back to RGBA16F may not work');
+    }
+
+    // ===== Shaders =====
+    function compileShader(src, type) {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        console.error('Shader compile error:', gl.getShaderInfoLog(s));
+        console.error(src);
+        throw new Error('Shader compile failed');
+      }
+      return s;
+    }
+    function linkProgram(vsSrc, fsSrc) {
+      const vs = compileShader(vsSrc, gl.VERTEX_SHADER);
+      const fs = compileShader(fsSrc, gl.FRAGMENT_SHADER);
+      const p = gl.createProgram();
+      gl.attachShader(p, vs);
+      gl.attachShader(p, fs);
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+        console.error('Link error:', gl.getProgramInfoLog(p));
+        throw new Error('Link failed');
+      }
+      return p;
+    }
+
+    const MAX_XFORMS = 6;
+
+    const vsAccSrc = document.getElementById('vs-acc').textContent;
+    const fsAccSrc = document.getElementById('fs-acc').textContent;
+    const vsDispSrc = document.getElementById('vs-disp').textContent;
+    const fsDispSrc = document.getElementById('fs-disp').textContent;
+
+    const accProgram = linkProgram(vsAccSrc, fsAccSrc);
+    const dispProgram = linkProgram(vsDispSrc, fsDispSrc);
+
+    // Acc uniforms
+    const accU = {
+      xform_a0: gl.getUniformLocation(accProgram, 'u_xform_a0'),
+      xform_a1: gl.getUniformLocation(accProgram, 'u_xform_a1'),
+      xform_meta: gl.getUniformLocation(accProgram, 'u_xform_meta'),
+      xform_count: gl.getUniformLocation(accProgram, 'u_xform_count'),
+      var_params: gl.getUniformLocation(accProgram, 'u_var_params'),
+      k_iter: gl.getUniformLocation(accProgram, 'u_k_iter'),
+      pre_iter: gl.getUniformLocation(accProgram, 'u_pre_iter'),
+      output_index: gl.getUniformLocation(accProgram, 'u_output_index'),
+      seed: gl.getUniformLocation(accProgram, 'u_seed'),
+      final_color: gl.getUniformLocation(accProgram, 'u_final_color'),
+    };
+
+    const dispU = {
+      acc: gl.getUniformLocation(dispProgram, 'u_acc'),
+      palette: gl.getUniformLocation(dispProgram, 'u_palette'),
+      gamma: gl.getUniformLocation(dispProgram, 'u_gamma'),
+      vibrancy: gl.getUniformLocation(dispProgram, 'u_vibrancy'),
+      brightness: gl.getUniformLocation(dispProgram, 'u_brightness'),
+    };
+
+    // ===== Empty VAO for accumulator (uses gl_VertexID, no buffer needed) =====
+    const accVAO = gl.createVertexArray();
+
+    // ===== Fullscreen quad for display =====
+    const quadVAO = gl.createVertexArray();
+    const quadBuf = gl.createBuffer();
+    gl.bindVertexArray(quadVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+    const aPosLoc = gl.getAttribLocation(dispProgram, 'a_pos');
+    gl.enableVertexAttribArray(aPosLoc);
+    gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+    // ===== Accumulator framebuffers (ping-pong) =====
+    function makeFloatTex(w, h) {
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      return tex;
+    }
+    const accTex = [makeFloatTex(ACC_SIZE, ACC_SIZE), makeFloatTex(ACC_SIZE, ACC_SIZE)];
+    const accFBO = [gl.createFramebuffer(), gl.createFramebuffer()];
+    for (let i = 0; i < 2; i++) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, accFBO[i]);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, accTex[i], 0);
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) console.error('FBO', i, 'incomplete:', status.toString(16));
+    }
+
+    let accReadIdx = 0;  // read from this one, write to the other
+
+    function clearAccumulator() {
+      for (let i = 0; i < 2; i++) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, accFBO[i]);
+        gl.viewport(0, 0, ACC_SIZE, ACC_SIZE);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
+    }
+
+    // ===== Palette texture =====
+    function buildPaletteTexture(sheep) {
+      const stops = sheep.palette;
+      const N = 256;
+      const data = new Float32Array(N * 4);
+      // Sort stops by position
+      const s = [...stops].sort((a, b) => a.pos - b.pos);
+      for (let i = 0; i < N; i++) {
+        const t = i / (N - 1);
+        // Find bracketing stops
+        let lo = s[0], hi = s[s.length - 1];
+        for (let j = 0; j < s.length - 1; j++) {
+          if (t >= s[j].pos && t <= s[j + 1].pos) { lo = s[j]; hi = s[j + 1]; break; }
+        }
+        const span = hi.pos - lo.pos;
+        const f = span > 0 ? (t - lo.pos) / span : 0;
+        const r = lo.rgb[0] * (1 - f) + hi.rgb[0] * f;
+        const g = lo.rgb[1] * (1 - f) + hi.rgb[1] * f;
+        const b = lo.rgb[2] * (1 - f) + hi.rgb[2] * f;
+        data[i * 4 + 0] = r;
+        data[i * 4 + 1] = g;
+        data[i * 4 + 2] = b;
+        data[i * 4 + 3] = 1.0;
+      }
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      // Upload as RGBA8 (8-bit is plenty for a palette). Use UNSIGNED_BYTE.
+      const data8 = new Uint8Array(N * 4);
+      for (let i = 0; i < N * 4; i++) data8[i] = Math.min(255, Math.max(0, Math.floor(data[i] * 255 + 0.5)));
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, N, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data8);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      return tex;
+    }
+
+    // ===== Genome → uniforms =====
+    function setXformUniforms(sheep, interpT) {
+      const xfs = sheep.xforms;
+      const n = Math.min(xfs.length, MAX_XFORMS);
+      const a0 = new Float32Array(MAX_XFORMS * 4);
+      const a1 = new Float32Array(MAX_XFORMS * 4);
+      const meta = new Float32Array(MAX_XFORMS * 3);
+
+      const kf0 = sheep.motion[Math.floor(interpT) % sheep.motion.length];
+      const kf1 = sheep.motion[(Math.floor(interpT) + 1) % sheep.motion.length];
+      const ft = interpT - Math.floor(interpT);
+
+      for (let i = 0; i < n; i++) {
+        const xf = xfs[i];
+        const c0 = kf0.coefs[i];
+        const c1 = kf1.coefs[i];
+        const lerped = c0.map((v, j) => v * (1 - ft) + c1[j] * ft);
+        a0[i * 4 + 0] = lerped[0]; // a
+        a0[i * 4 + 1] = lerped[1]; // b
+        a0[i * 4 + 2] = lerped[2]; // c
+        a0[i * 4 + 3] = 0;
+        a1[i * 4 + 0] = lerped[3]; // d
+        a1[i * 4 + 1] = lerped[4]; // e
+        a1[i * 4 + 2] = lerped[5]; // f
+        a1[i * 4 + 3] = 0;
+
+        meta[i * 3 + 0] = xf.color;
+        meta[i * 3 + 1] = xf.weight;
+        meta[i * 3 + 2] = variationId(xf.variations[0]?.name);
+      }
+      gl.uniform4fv(accU.xform_a0, a0);
+      gl.uniform4fv(accU.xform_a1, a1);
+      gl.uniform3fv(accU.xform_meta, meta);
+      gl.uniform1i(accU.xform_count, n);
+    }
+
+    const VARIATION_IDS = {
+      linear: 0, sinusoidal: 1, spherical: 2, swirl: 3, horseshoe: 4,
+      polar: 5, handkerchief: 6, heart: 7, disc: 8, julian: 9,
+      juliaN: 10, blob: 11, fisheye: 12, tangent: 13,
+    };
+    function variationId(name) { return VARIATION_IDS[name] ?? 0; }
+
+    // ===== Sheep state =====
+    /** @type {Array} */
+    let sheep = [...SHEEP_POOL];
+    let sheepIdx = 0;
+    let paletteTex = buildPaletteTexture(sheep[0]);
+    let paused = false;
+    let interpStart = performance.now();
+    const interpDuration = 30000;  // 30s per motion keyframe segment
+
+    function currentSheep() { return sheep[sheepIdx]; }
+
+    function switchSheep(newIdx, newSheep = null) {
+      if (newSheep) sheep.push(newSheep);
+      sheepIdx = ((newIdx % sheep.length) + sheep.length) % sheep.length;
+      paletteTex = buildPaletteTexture(currentSheep());
+      interpStart = performance.now();
+      clearAccumulator();
+      updateHud();
+    }
+
+    // ===== Vote tracking (local-only MVP) =====
+    function voteLocal(dir) {
+      const s = currentSheep();
+      s._votes = (s._votes ?? 0) + dir;
+      try {
+        const all = JSON.parse(localStorage.getItem('websheep:votes') ?? '{}');
+        all[s.id] = s._votes;
+        localStorage.setItem('websheep:votes', JSON.stringify(all));
+      } catch {}
+      updateHud();
+    }
+    function loadVotes() {
+      try {
+        const all = JSON.parse(localStorage.getItem('websheep:votes') ?? '{}');
+        for (const s of sheep) if (all[s.id]) s._votes = all[s.id];
+      } catch {}
+    }
+    loadVotes();
+
+    // ===== Frame loop =====
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.floor(window.innerWidth * dpr);
+      const h = Math.floor(window.innerHeight * dpr);
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w; canvas.height = h;
+      }
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    let frameCount = 0;
+    let lastFpsCheck = performance.now();
+
+    function frame() {
+      const now = performance.now();
+      const dt = now - interpStart;
+      const interpT = paused ? (interpStart - performance.now()) / interpDuration + dt / interpDuration
+                              : dt / interpDuration * (sheep[sheepIdx].motion.length);
+
+      resize();
+
+      // ===== ACCUMULATION =====
+      gl.useProgram(accProgram);
+      gl.bindVertexArray(accVAO);
+
+      // Seed slowly varies so the pattern is diverse
+      const seed = (now * 0.001) % 100000;
+
+      gl.uniform1f(accU.seed, seed);
+      gl.uniform1i(accU.k_iter, K_ITER);
+      gl.uniform1i(accU.pre_iter, PRE_ITER);
+      gl.uniform1f(accU.final_color, 0.5);
+      const vp = currentSheep().variationParams ?? [2, 2, 0, 0];
+      gl.uniform1fv(accU.var_params, vp);
+
+      // Set xform uniforms at interpolated coefs
+      setXformUniforms(currentSheep(), paused ? lastFrozenT : interpT);
+      if (paused) lastFrozenT = interpT;
+
+      const writeIdx = 1 - accReadIdx;
+
+      // Copy previous accumulator (accReadIdx) → writeIdx, preserving history
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, accFBO[accReadIdx]);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, accFBO[writeIdx]);
+      gl.blitFramebuffer(0, 0, ACC_SIZE, ACC_SIZE, 0, 0, ACC_SIZE, ACC_SIZE, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+
+      // Now additive-blend new samples on top of writeIdx
+      gl.bindFramebuffer(gl.FRAMEBUFFER, accFBO[writeIdx]);
+      gl.viewport(0, 0, ACC_SIZE, ACC_SIZE);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE);
+
+      // Multi-pass: emit each intermediate iteration as a separate sample
+      for (let k = 0; k < MULTI_PASSES; k++) {
+        gl.uniform1i(accU.output_index, k);
+        gl.drawArrays(gl.POINTS, 0, N_VERTS);
+      }
+
+      gl.disable(gl.BLEND);
+      accReadIdx = writeIdx;
+
+      // ===== DISPLAY =====
+      gl.useProgram(dispProgram);
+      gl.bindVertexArray(quadVAO);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, accTex[accReadIdx]);
+      gl.uniform1i(dispU.acc, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, paletteTex);
+      gl.uniform1i(dispU.palette, 1);
+      gl.uniform1f(dispU.gamma, currentSheep().gamma);
+      gl.uniform1f(dispU.vibrancy, currentSheep().vibrancy);
+      gl.uniform1f(dispU.brightness, currentSheep().brightness);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      frameCount++;
+      if (now - lastFpsCheck > 1000) {
+        const fps = (frameCount * 1000) / (now - lastFpsCheck);
+        console.log(`FPS: ${fps.toFixed(1)} | sheep: ${currentSheep().name} (${sheepIdx + 1}/${sheep.length})`);
+        frameCount = 0;
+        lastFpsCheck = now;
+      }
+
+      requestAnimationFrame(frame);
+    }
+
+    let lastFrozenT = 0;
+
+    // ===== HUD =====
+    const hudEl = document.getElementById('hud');
+    function updateHud() {
+      const s = currentSheep();
+      hudEl.innerHTML = `WebSheep · <b style="color:rgba(255,255,255,0.85)">${escapeHtml(s.name)}</b> · gen ${s.generation} · votes ${s._votes ?? 0} · pool ${sheepIdx + 1}/${sheep.length}`;
+    }
+    function escapeHtml(s) { return s.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+
+    // ===== Input =====
+    const helpEl = document.getElementById('help');
+    let helpVisible = false;
+    const noticeEl = document.getElementById('notice');
+
+    window.addEventListener('keydown', (e) => {
+      // Dismiss notice on first interaction
+      if (!noticeEl.classList.contains('fade')) {
+        noticeEl.classList.add('fade');
+        setTimeout(() => noticeEl.remove(), 700);
+      }
+
+      switch (e.key) {
+        case 'f': case 'F':
+          if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
+          else document.exitFullscreen?.();
+          break;
+        case 'ArrowRight': case ' ':
+          e.preventDefault();
+          switchSheep(sheepIdx + 1);
+          break;
+        case 'ArrowLeft':
+          e.preventDefault();
+          switchSheep(sheepIdx - 1);
+          break;
+        case 'ArrowUp':
+          voteLocal(+1);
+          break;
+        case 'ArrowDown':
+          voteLocal(-1);
+          break;
+        case 'm': case 'M':
+          if (e.shiftKey) {
+            // Crossover with random other sheep (Shift+M)
+            const partner = sheep[Math.floor(Math.random() * sheep.length)];
+            if (partner.id !== currentSheep().id) {
+              const child = crossover(currentSheep(), partner);
+              child.name = `${currentSheep().name} × ${partner.name}`;
+              switchSheep(sheep.length, child);
+            }
+          } else {
+            // Mutate current sheep
+            const child = mutate(currentSheep());
+            switchSheep(sheep.length, child);
+          }
+          break;
+        case 'x': case 'X':
+          const partner = sheep[Math.floor(Math.random() * sheep.length)];
+          if (partner.id !== currentSheep().id) {
+            const child = crossover(currentSheep(), partner);
+            child.name = `${currentSheep().name} × ${partner.name}`;
+            switchSheep(sheep.length, child);
+          }
+          break;
+        case 'p': case 'P':
+          paused = !paused;
+          if (paused) interpStart = performance.now() - lastFrozenT * interpDuration;
+          break;
+        case 'r': case 'R':
+          clearAccumulator();
+          break;
+        case '?':
+          helpVisible = !helpVisible;
+          helpEl.classList.toggle('show', helpVisible);
+          break;
+      }
+    });
+
+    // Boot
+    updateHud();
+    console.log(`WebSheep — ${sheep.length} sheep loaded.`);
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
