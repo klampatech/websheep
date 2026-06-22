@@ -215,27 +215,31 @@
   in vec2 v_uv;
   out vec4 fragColor;
   uniform sampler2D u_acc;
+  uniform sampler2D u_old_acc;   // snapshot of previous accumulator (zero if none)
   uniform sampler2D u_palette;
   uniform float u_gamma;
   uniform float u_vibrancy;
   uniform float u_brightness;
-  void main() {
-    vec4 hist = texture(u_acc, v_uv);
+  uniform float u_fade;          // 0 = full old, 1 = full new
+
+  vec4 renderSheep(sampler2D acc) {
+    vec4 hist = texture(acc, v_uv);
     float hits = hist.a;
-    if (hits < 1.0) { fragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
-
-    // Average color of samples that landed here
+    if (hits < 1.0) return vec4(0.0, 0.0, 0.0, 1.0);
     vec3 avg = hist.rgb / hits;
-
-    // Map log(hits) to palette index
-    float logD = log(1.0 + hits) / 8.0;     // 8 = empirical normalization
+    float logD = log(1.0 + hits) / 8.0;
     logD = clamp(logD, 0.0, 1.0);
     logD = fract(logD + u_vibrancy * 0.5);
-
     vec3 pal = texture(u_palette, vec2(logD, 0.5)).rgb;
     vec3 final = avg * pal * u_brightness;
     final = pow(max(final, vec3(0.0)), vec3(1.0 / u_gamma));
-    fragColor = vec4(final, 1.0);
+    return vec4(final, 1.0);
+  }
+
+  void main() {
+    vec4 newCol = renderSheep(u_acc);
+    vec4 oldCol = renderSheep(u_old_acc);
+    fragColor = mix(oldCol, newCol, u_fade);
   }
   </script>
 
@@ -313,10 +317,12 @@
 
     const dispU = {
       acc: gl.getUniformLocation(dispProgram, 'u_acc'),
+      old_acc: gl.getUniformLocation(dispProgram, 'u_old_acc'),
       palette: gl.getUniformLocation(dispProgram, 'u_palette'),
       gamma: gl.getUniformLocation(dispProgram, 'u_gamma'),
       vibrancy: gl.getUniformLocation(dispProgram, 'u_vibrancy'),
       brightness: gl.getUniformLocation(dispProgram, 'u_brightness'),
+      fade: gl.getUniformLocation(dispProgram, 'u_fade'),
     };
 
     // ===== Empty VAO for accumulator (uses gl_VertexID, no buffer needed) =====
@@ -361,6 +367,24 @@
         gl.clearColor(0, 0, 0, 0);
         gl.clear(gl.COLOR_BUFFER_BIT);
       }
+    }
+
+    // ===== Snapshot FBO (holds a copy of the live accumulator at switch time, for cross-fade) =====
+    const snapTex = makeFloatTex(ACC_SIZE, ACC_SIZE);
+    const snapFBO = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, snapFBO);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, snapTex, 0);
+    gl.viewport(0, 0, ACC_SIZE, ACC_SIZE);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    function snapshotAccumulator() {
+      // Copy current live accumulator (accReadIdx) → snapFBO via blit
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, accFBO[accReadIdx]);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, snapFBO);
+      gl.blitFramebuffer(0, 0, ACC_SIZE, ACC_SIZE, 0, 0, ACC_SIZE, ACC_SIZE, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     }
 
     // ===== Palette texture =====
@@ -454,12 +478,23 @@
 
     function currentSheep() { return sheep[sheepIdx]; }
 
+    // ===== Cross-fade transition =====
+    const TRANSITION_DURATION = 1500;  // ms
+    let transitionActive = false;
+    let transitionStart = 0;
+
     function switchSheep(newIdx, newSheep = null) {
       if (newSheep) sheep.push(newSheep);
       sheepIdx = ((newIdx % sheep.length) + sheep.length) % sheep.length;
       paletteTex = buildPaletteTexture(currentSheep());
-      interpStart = performance.now();
+
+      // Cross-fade: snapshot current accumulator before clearing, arm the fade
+      snapshotAccumulator();
+      transitionStart = performance.now();
+      transitionActive = true;
+
       clearAccumulator();
+      interpStart = performance.now();
       updateHud();
     }
 
@@ -554,11 +589,21 @@
       gl.bindTexture(gl.TEXTURE_2D, accTex[accReadIdx]);
       gl.uniform1i(dispU.acc, 0);
       gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, snapTex);
+      gl.uniform1i(dispU.old_acc, 1);
+      gl.activeTexture(gl.TEXTURE2);
       gl.bindTexture(gl.TEXTURE_2D, paletteTex);
-      gl.uniform1i(dispU.palette, 1);
+      gl.uniform1i(dispU.palette, 2);
       gl.uniform1f(dispU.gamma, currentSheep().gamma);
       gl.uniform1f(dispU.vibrancy, currentSheep().vibrancy);
       gl.uniform1f(dispU.brightness, currentSheep().brightness);
+
+      // Cross-fade progress: 0 = full old snapshot, 1 = full new live
+      const fade = transitionActive
+        ? Math.min(1, (now - transitionStart) / TRANSITION_DURATION)
+        : 1.0;
+      if (transitionActive && fade >= 1) transitionActive = false;
+      gl.uniform1f(dispU.fade, fade);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
       frameCount++;
@@ -642,6 +687,8 @@
           break;
         case 'r': case 'R':
           clearAccumulator();
+          // Cancel any active fade so we don't end up with "old fading out + black building up"
+          transitionActive = false;
           break;
         case '?':
           helpVisible = !helpVisible;

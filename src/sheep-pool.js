@@ -49,7 +49,7 @@ function rotateKeyframes(baseCoefs, steps = 4, maxAngle = Math.PI * 0.3) {
 
 function makeSheep(name, palette, xforms, opts = {}) {
   const baseCoefs = xforms.map(xf => xf.coefs);
-  const motion = opts.motion ?? rotateKeyframes(baseCoefs, 4, Math.PI * 0.25);
+  const motion = opts.motion ?? rotateKeyframes(baseCoefs, 8, Math.PI * 0.25);
   return {
     id: newId(),
     name,
