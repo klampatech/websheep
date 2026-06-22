@@ -252,7 +252,7 @@
     const MULTI_PASSES = K_ITER;     // emit each intermediate iteration
 
     const canvas = document.getElementById('gl');
-    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, premultipliedAlpha: false });
+    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, premultipliedAlpha: false, preserveDrawingBuffer: true });
     if (!gl) {
       document.body.innerHTML = '<div style="color:#fff;font-family:monospace;padding:40px">WebGL2 not available. Try Chrome, Firefox, or Safari 15+.</div>';
       throw new Error('No WebGL2');
